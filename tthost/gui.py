@@ -353,6 +353,7 @@ def run(scene_path=None):
     params.app_window_params.window_title = "TinyTracer"
     params.app_window_params.window_geometry.size = (1280, 820)
     params.fps_idling.enable_idling = False
+
     # draw() makes its own full-screen window; hello_imgui's default one would sit on top and eat input
     params.imgui_window_params.default_imgui_window_type = hello_imgui.DefaultImGuiWindowType.no_default_window
     params.callbacks.show_gui = lambda: draw(state)

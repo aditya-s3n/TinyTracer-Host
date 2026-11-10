@@ -8,3 +8,6 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+
+# hello_imgui saved window/theme state
+*.ini
