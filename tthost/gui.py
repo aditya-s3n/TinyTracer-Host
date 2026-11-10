@@ -30,7 +30,6 @@ from imgui_bundle import hello_imgui, imgui, immapp, portable_file_dialogs as pf
 from tthost.transport import BACKENDS, DEFAULT_BAUD, IMAGE_SIZE
 
 TOTAL_PIXELS = IMAGE_SIZE * IMAGE_SIZE
-VALID_SPP = (1, 2, 4, 8, 16, 32)
 LOG_LINES = 500           # event log lines kept in the panel
 PANEL_WIDTH = 420         # run panel width in pixels
 
@@ -64,11 +63,14 @@ class GuiState:
         self.scene_status = "no scene loaded"
         self.open_dialog = None
 
+        # scene designer (Rust app) link over pipes: it sends START, we answer ACK.
+        # Nothing sets this yet; the pipe handler will flip it when the handshake completes.
+        self.designer_connected = False
+
         # link and render settings
         self.backend_idx = 0
         self.port = "/dev/ttyUSB0"
         self.baud = DEFAULT_BAUD
-        self.spp_idx = VALID_SPP.index(32)
 
         # run
         self.state = IDLE
@@ -123,8 +125,7 @@ def start_render(s):
     s.cancel_event.clear()
     s.start_time = time.monotonic()
     s.end_time = None
-    s.add_log(f"render: backend={BACKENDS[s.backend_idx]} port={s.port} baud={s.baud} "
-              f"spp={VALID_SPP[s.spp_idx]}")
+    s.add_log(f"render: backend={BACKENDS[s.backend_idx]} port={s.port} baud={s.baud}")
     s.worker = threading.Thread(target=_placeholder_render, args=(s,), daemon=True)
     s.worker.start()
 
@@ -170,6 +171,20 @@ def _placeholder_render(s):
 
 # -- panels ------------------------------------------------------------------------
 
+def draw_designer_status(s):
+    """One line under the scene row: is the scene designer connected over the pipes?"""
+    if s.designer_connected:
+        color, label = imgui.ImVec4(0.30, 0.85, 0.40, 1.0), "connected"
+    else:
+        color, label = imgui.ImVec4(0.85, 0.30, 0.30, 1.0), "not connected"
+    imgui.text("Scene designer:")
+    imgui.same_line()
+    imgui.text_colored(color, label)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("Pipe link to the scene designer.\n"
+                          "Connected once it sends START and we reply ACK.")
+
+
 def draw_loading_section(s):
     imgui.separator_text("Scene")
     imgui.set_next_item_width(-160)
@@ -182,6 +197,8 @@ def draw_loading_section(s):
     if imgui.button("Load"):
         s.load_scene(s.scene_path)
     imgui.end_disabled()
+
+    draw_designer_status(s)
 
     if s.open_dialog is not None and s.open_dialog.ready():
         result = s.open_dialog.result()
@@ -203,8 +220,6 @@ def draw_loading_section(s):
     _, s.port = imgui.input_text("Port", s.port)
     imgui.set_next_item_width(-80)
     _, s.baud = imgui.input_int("Baud", s.baud, 0)
-    imgui.set_next_item_width(-80)
-    _, s.spp_idx = imgui.combo("SPP", s.spp_idx, [str(v) for v in VALID_SPP])
     imgui.end_disabled()
 
 
@@ -239,7 +254,7 @@ def draw_send_section(s):
             ("Elapsed", f"{elapsed:.1f} s"),
             ("ETA", f"{eta:.1f} s" if s.is_active() else "-"),
             ("Rate", f"{rate:,.0f} px/s"),
-            ("Bad pixels", f"{int(s.fb.bad.sum())}"),
+            ("Noisy pixels", f"{int(s.fb.bad.sum())}"),
         ):
             imgui.table_next_row()
             imgui.table_next_column()
