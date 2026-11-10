@@ -1,13 +1,15 @@
 """TinyTracer app window: run panel and live render view (see design doc, section 8.1).
 
-One ImGui window (imgui-bundle) with two panels:
+One ImGui window (imgui-bundle) with three columns:
 
     Run panel         scene loading, backend picker, Send (render) and Cancel,
                       progress, pixels, current row, elapsed, ETA, pixel rate,
-                      bad pixel count, and the latest event log lines.
+                      bad pixel count, and the pipe IPC log (raw traffic with
+                      the Rust scene designer).
     Live render view  the 512 x 512 frame filling in row by row, with a marker
                       line on the current row. Shows the raw chip values; the
                       processed (sRGB) view comes later.
+    Event log         the latest event log lines, beside the render view.
 
 The frame buffer is a linear float32 numpy array shared with the worker
 thread: only the worker writes it, only the window reads it, and the texture
@@ -32,6 +34,7 @@ from tthost.transport import BACKENDS, DEFAULT_BAUD, IMAGE_SIZE
 TOTAL_PIXELS = IMAGE_SIZE * IMAGE_SIZE
 LOG_LINES = 500           # event log lines kept in the panel
 PANEL_WIDTH = 420         # run panel width in pixels
+LOG_WIDTH = 380           # event log column width in pixels
 
 # run controller states (design doc, figure 8.1)
 IDLE, COMPILING, UPLOADING, RENDERING, PROCESSING, DONE, ERROR = (
@@ -84,6 +87,12 @@ class GuiState:
         self.log = collections.deque(maxlen=LOG_LINES)
         self.log_autoscroll = True
 
+        # pipe IPC log: messages to/from the scene designer. Nothing feeds it yet;
+        # the pipe handler will call add_ipc_log() for every message in each direction.
+        self.app_start = time.monotonic()
+        self.ipc_log = collections.deque(maxlen=LOG_LINES)
+        self.ipc_log_autoscroll = True
+
         # live view
         self.texture_id = None
         self.uploaded_count = -1
@@ -93,6 +102,15 @@ class GuiState:
     def add_log(self, message):
         t = 0.0 if self.start_time is None else time.monotonic() - self.start_time
         self.log.append(f"{t:9.3f}  {message}")
+
+    def add_ipc_log(self, direction, message):
+        """Record one pipe message. `direction` is "rx" (from the designer) or "tx" (to it).
+
+        Safe to call from the pipe reader thread (deque.append is atomic).
+        """
+        t = time.monotonic() - self.app_start
+        arrow = "<-" if direction == "rx" else "->"
+        self.ipc_log.append(f"{t:9.3f}  {arrow} {message}")
 
     def is_active(self):
         return self.state in ACTIVE_STATES
@@ -264,19 +282,35 @@ def draw_send_section(s):
         imgui.end_table()
 
 
-def draw_log_section(s):
-    imgui.separator_text("Event log")
+def draw_scrolling_log(title, child_id, lines, autoscroll):
+    """Header, Clear + Auto-scroll controls and a bordered child filling the remaining space.
+
+    Returns the new auto-scroll setting.
+    """
+    imgui.separator_text(title)
+    imgui.push_id(child_id)
     if imgui.small_button("Clear"):
-        s.log.clear()
+        lines.clear()
     imgui.same_line()
-    _, s.log_autoscroll = imgui.checkbox("Auto-scroll", s.log_autoscroll)
-    imgui.begin_child("log", imgui.ImVec2(-1, -1), imgui.ChildFlags_.borders,
+    _, autoscroll = imgui.checkbox("Auto-scroll", autoscroll)
+    imgui.begin_child(child_id, imgui.ImVec2(-1, -1), imgui.ChildFlags_.borders,
                       imgui.WindowFlags_.horizontal_scrollbar)
-    for line in list(s.log):
+    for line in list(lines):
         imgui.text_unformatted(line)
-    if s.log_autoscroll and imgui.get_scroll_y() >= imgui.get_scroll_max_y() - 1:
+    if autoscroll and imgui.get_scroll_y() >= imgui.get_scroll_max_y() - 1:
         imgui.set_scroll_here_y(1.0)
     imgui.end_child()
+    imgui.pop_id()
+    return autoscroll
+
+
+def draw_log_section(s):
+    s.log_autoscroll = draw_scrolling_log("Event log", "log", s.log, s.log_autoscroll)
+
+
+def draw_ipc_log_section(s):
+    s.ipc_log_autoscroll = draw_scrolling_log("Pipe IPC log", "ipc_log", s.ipc_log,
+                                              s.ipc_log_autoscroll)
 
 
 def upload_texture(s):
@@ -332,13 +366,22 @@ def draw(s):
     imgui.begin_child("run_panel", imgui.ImVec2(PANEL_WIDTH, 0), imgui.ChildFlags_.resize_x)
     draw_loading_section(s)
     draw_send_section(s)
-    draw_log_section(s)
+    draw_ipc_log_section(s)
     imgui.end_child()
 
     imgui.same_line()
 
-    imgui.begin_child("live_view", imgui.ImVec2(0, 0))
+    # live view takes whatever width is left after the log column
+    spacing = imgui.get_style().item_spacing.x
+    view_width = max(64.0, imgui.get_content_region_avail().x - LOG_WIDTH - spacing)
+    imgui.begin_child("live_view", imgui.ImVec2(view_width, 0))
     draw_live_view(s)
+    imgui.end_child()
+
+    imgui.same_line()
+
+    imgui.begin_child("log_panel", imgui.ImVec2(0, 0))
+    draw_log_section(s)
     imgui.end_child()
 
     imgui.end()
@@ -351,7 +394,7 @@ def run(scene_path=None):
         state.load_scene(scene_path)
     params = hello_imgui.RunnerParams()
     params.app_window_params.window_title = "TinyTracer"
-    params.app_window_params.window_geometry.size = (1280, 820)
+    params.app_window_params.window_geometry.size = (1600, 820)
     params.fps_idling.enable_idling = False
 
     # draw() makes its own full-screen window; hello_imgui's default one would sit on top and eat input
