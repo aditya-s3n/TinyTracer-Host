@@ -29,6 +29,7 @@ import numpy as np
 from OpenGL import GL
 from imgui_bundle import hello_imgui, imgui, immapp, portable_file_dialogs as pfd
 
+from tthost.framebuffer import FrameBuffer
 from tthost.transport import BACKENDS, DEFAULT_BAUD, IMAGE_SIZE
 
 TOTAL_PIXELS = IMAGE_SIZE * IMAGE_SIZE
@@ -40,20 +41,6 @@ LOG_WIDTH = 380           # event log column width in pixels
 IDLE, COMPILING, UPLOADING, RENDERING, PROCESSING, DONE, ERROR = (
     "idle", "compiling", "uploading", "rendering", "processing", "done", "error")
 ACTIVE_STATES = (COMPILING, UPLOADING, RENDERING, PROCESSING)
-
-
-class FrameBuffer:
-    """Linear float32 512 x 512 RGB image plus a received count and bad-pixel mask."""
-
-    def __init__(self):
-        self.pixels = np.zeros((IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.float32)
-        self.bad = np.zeros((IMAGE_SIZE, IMAGE_SIZE), dtype=bool)
-        self.count = 0
-
-    def clear(self):
-        self.pixels[:] = 0
-        self.bad[:] = False
-        self.count = 0
 
 
 class GuiState:
