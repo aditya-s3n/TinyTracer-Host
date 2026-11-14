@@ -96,8 +96,9 @@ class SimLink:
         self._buffer = bytearray()
 
     def _fill(self, timeout):
-        ready, _, _ = select.select([self._fd], [], [], timeout)
-        if ready:
+        readable, writable, exceptional = select.select([self._fd], [], [], timeout)
+        
+        if readable:
 
             try:
                 self._buffer.extend(os.read(self._fd, 65536))
