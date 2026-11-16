@@ -11,3 +11,6 @@ venv/
 
 # hello_imgui saved window/theme state
 *.ini
+
+# Rust build output (scene designer)
+designer/target/

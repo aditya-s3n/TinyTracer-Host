@@ -1,0 +1,19 @@
+# TinyTracer scene, written by the scene designer.
+# z is up. Colours are 0-255. Positions must stay within +-256.
+#   sphere x y z r   material R G B strength
+
+image   512
+spp     32
+camera  5 5 12   45 -12 90
+sky     255 255 255  187 218 255
+ground  204 204 199
+checker 120 120 130
+
+# Red matte
+sphere 32 22 6  6   matte  219 61 51  0
+
+# Chrome
+sphere 28 12 4  4   mirror  242 242 242  0
+
+# Lamp
+sphere 20 26 2.5  2.5   glow  255 171 79  1.5

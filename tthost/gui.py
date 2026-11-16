@@ -22,6 +22,7 @@ placeholder worker that fills the frame with a test pattern. Replace
 
 import collections
 import os
+import sys
 import threading
 import time
 
@@ -29,7 +30,10 @@ import numpy as np
 from OpenGL import GL
 from imgui_bundle import hello_imgui, imgui, immapp, portable_file_dialogs as pfd
 
+from tthost import __version__
 from tthost.framebuffer import FrameBuffer
+from tthost.ipc import DesignerLink
+from tthost.run_controller import compile_text
 from tthost.transport import BACKENDS, DEFAULT_BAUD, IMAGE_SIZE
 
 TOTAL_PIXELS = IMAGE_SIZE * IMAGE_SIZE
@@ -53,9 +57,10 @@ class GuiState:
         self.scene_status = "no scene loaded"
         self.open_dialog = None
 
-        # scene designer (Rust app) link over pipes: it sends START, we answer ACK.
-        # Nothing sets this yet; the pipe handler will flip it when the handshake completes.
+        # scene designer (Rust app) link over pipes: it sends hello, we answer ready.
+        # Set by the pipe handler (tthost/ipc.py) on its reader thread.
         self.designer_connected = False
+        self.designer_closed = False   # the designer closed our stdin: time to exit
 
         # link and render settings
         self.backend_idx = 0
@@ -74,8 +79,7 @@ class GuiState:
         self.log = collections.deque(maxlen=LOG_LINES)
         self.log_autoscroll = True
 
-        # pipe IPC log: messages to/from the scene designer. Nothing feeds it yet;
-        # the pipe handler will call add_ipc_log() for every message in each direction.
+        # pipe IPC log: every message to/from the scene designer, fed by the pipe handler.
         self.app_start = time.monotonic()
         self.ipc_log = collections.deque(maxlen=LOG_LINES)
         self.ipc_log_autoscroll = True
@@ -121,6 +125,28 @@ class GuiState:
         lines = self.scene_text.count("\n") + 1
         self.scene_status = f"loaded {os.path.basename(path)} ({lines} lines)"
         self.add_log(f"scene loaded: {path}")
+
+    # -- scene designer link (called on the pipe reader thread) ---------------
+
+    def on_designer_scene(self, rev, text):
+        """A "scene" message arrived: show it as the loaded scene and return the compiler's verdict."""
+        if self.is_active():
+            return {"errors": [{"line": None, "rule": "a render is running; scene not loaded"}]}
+        self.scene_text = text
+        self.scene_path = ""
+        lines = text.count("\n") + 1
+        self.scene_status = f"from scene designer (rev {rev}, {lines} lines)"
+        self.add_log(f"scene received from designer: rev {rev}")
+        _, report = compile_text(text, "<designer>")
+        return {key: report[key] for key in ("words", "bvs", "errors", "warnings")}
+
+    def on_designer_connected(self):
+        self.designer_connected = True
+        self.add_log("scene designer connected")
+
+    def on_designer_closed(self):
+        self.designer_connected = False
+        self.designer_closed = True
 
 
 # -- run control ----------------------------------------------------------------
@@ -187,7 +213,7 @@ def draw_designer_status(s):
     imgui.text_colored(color, label)
     if imgui.is_item_hovered():
         imgui.set_tooltip("Pipe link to the scene designer.\n"
-                          "Connected once it sends START and we reply ACK.")
+                          "Connected once it sends hello and we reply ready.")
 
 
 def draw_loading_section(s):
@@ -343,6 +369,10 @@ def draw_live_view(s):
 
 
 def draw(s):
+    if s.designer_closed:
+        # We are the designer's child process: when it goes away, so do we.
+        hello_imgui.get_runner_params().app_shall_exit = True
+
     viewport = imgui.get_main_viewport()
     imgui.set_next_window_pos(viewport.work_pos)
     imgui.set_next_window_size(viewport.work_size)
@@ -374,11 +404,21 @@ def draw(s):
     imgui.end()
 
 
-def run(scene_path=None):
-    """Open the TinyTracer window and block until it is closed."""
+def run(scene_path=None, ipc_out=None):
+    """Open the TinyTracer window and block until it is closed.
+
+    `ipc_out` is the protocol stream from ipc.claim_stdout() when the scene
+    designer started this app; None when the app runs on its own.
+    """
     state = GuiState()
     if scene_path:
         state.load_scene(scene_path)
+    if ipc_out is not None:
+        DesignerLink(sys.stdin, ipc_out, version=__version__,
+                     on_scene=state.on_designer_scene,
+                     on_connected=state.on_designer_connected,
+                     on_closed=state.on_designer_closed,
+                     on_log=state.add_ipc_log).start()
     params = hello_imgui.RunnerParams()
     params.app_window_params.window_title = "TinyTracer"
     params.app_window_params.window_geometry.size = (1600, 820)
