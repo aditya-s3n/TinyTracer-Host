@@ -15,6 +15,8 @@ States (section 8.2, figure 8.1):
              send RENDER, turn receiver rows into progress messages
     After    run the image pipeline, save render.png / render_raw.png /
              render_linear.npy, write the log summary, send done
+    Always   when a run that got as far as its run folder ends (done, error,
+             timeout or cancel), write run_log.txt: the whole run as readable text
 
 Rules:
     - reject render while a run is active
@@ -43,7 +45,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tthost import scene_compiler, transport
+from tthost import runlog, scene_compiler, transport
 from tthost.framebuffer import FrameBuffer
 from tthost.receive import TOTAL_PIXELS, PixelReceiver
 
@@ -123,6 +125,7 @@ class RunResult:
     bad: int
     complete: bool
     total_s: float
+    log: str | None = None          # run_log.txt, the readable log of the whole run
 
 
 class RunController:
@@ -168,6 +171,7 @@ class RunController:
         self._run_start = None
         self._render_start = None
         self._expected = TOTAL_PIXELS
+        self._run_dir = None
 
     # Public API (window, IPC, CLI)
     @property
@@ -281,6 +285,7 @@ class RunController:
         Always closes the link and log files. Returns the RunResult (or None).
         """
         self._run_start = time.monotonic()
+        self._run_dir = None
 
         try:
             run_dir = self._before_run(settings)
@@ -300,7 +305,7 @@ class RunController:
             self._close_logs()
             self._close_link()
             self._set_state(DONE)
-
+            result.log = self._write_run_log("done")
 
             if self.on_done is not None:
                 self.on_done(result)
@@ -308,6 +313,7 @@ class RunController:
 
         except _Cancelled:
             self._reset_and_idle(None)
+            self._write_run_log("cancelled")
             if raise_errors:
                 raise RunError("run cancelled") from None
             return None
@@ -315,6 +321,7 @@ class RunController:
         except Exception as e:
             message = str(e) if isinstance(e, RunError) else f"{type(e).__name__}: {e}"
             self._reset_and_idle(message)
+            self._write_run_log(f"error: {message}")
             if raise_errors:
                 raise e if isinstance(e, RunError) else RunError(message) from e
             return None
@@ -372,7 +379,7 @@ class RunController:
             raise RunError(f"scene has errors: {rules}")
         self._check_cancel()
 
-        run_dir = make_run_dir(settings.runs_dir, name)
+        run_dir = self._run_dir = make_run_dir(settings.runs_dir, name)
         save_run_inputs(run_dir, text, self._hex)
         self._raw_log, self._event_log = open_run_logs(run_dir)
 
@@ -504,6 +511,19 @@ class RunController:
             complete=frame_result.complete,
             total_s=total_s,
         )
+
+    def _write_run_log(self, outcome):
+        """Write run_log.txt into the run folder and return its path (None if there is no folder).
+
+        Never raises: a problem writing the log must not turn a finished render into a failed one.
+        """
+        if self._run_dir is None:
+            return None
+        try:
+            return runlog.write_run_log(self._run_dir, outcome, self.framebuffer)
+        except Exception as e:
+            transport.log_event(self._event_log, "anomaly", kind="run_log_failed", message=str(e))
+            return None
 
     def _on_row(self, y, pixels, bad):
         """Receiver row callback: build a Progress (with ETA) and send it to on_progress."""

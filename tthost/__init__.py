@@ -8,6 +8,7 @@ Modules:
     transport       UART framing and backend links
     receive         PIXEL byte stream -> frame buffer
     framebuffer     the linear image the receiver fills
+    runlog          run_log.txt: the readable log written when a run ends
     ipc             JSON-lines pipe link to the scene designer
     fake_chip       stand-in chip for testing with no hardware
 """

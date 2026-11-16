@@ -18,3 +18,7 @@ cd designer && cargo run --release
 .venv/bin/python -m tthost ports
 .venv/bin/python -m tthost render scene_demo.txt --backend chip --port /dev/ttyUSB0
    Or in the designer, leave the stand-in box unticked and set the backend and port in the Python window. If the picture is wrong, compare sram.hex in the run folder against the RTL's memory, and raw_bytes.log against the wire.
+
+
+
+logging, final check, ray cast or rasterization?

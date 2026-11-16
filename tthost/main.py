@@ -127,6 +127,7 @@ def cmd_render(args):
         return 1
     print(file=sys.stderr)
     print(f"{result.pixels} pixels in {result.total_s:.1f} s, {result.bad} bad")
+    print(f"log: {result.log}")
     print(result.png)
     return 0
 

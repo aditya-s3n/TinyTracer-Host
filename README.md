@@ -46,7 +46,14 @@ python -m pytest tests
 ```
 
 Every render gets a folder under `runs/` with the PNG, the raw linear image,
-the scene, the memory image and both logs.
+the scene, the memory image and the logs:
+
+- `run_log.txt`: the whole run as readable text, written when the run ends
+  (finished, failed or cancelled). What ran, latency (upload, RENDER to first
+  pixel, per pixel, per row, pixel rate), anomalies, a timeline, and one line
+  per row and per pixel with its position, colour and arrival time.
+- `events.jsonl`: the same events as they happened, one JSON object per line.
+- `raw_bytes.log`: every byte sent and received, before unescaping.
 
 ### Without hardware
 

@@ -170,9 +170,11 @@ class GuiState:
         # Absolute paths: the designer may not share this app's working directory.
         png = os.path.abspath(result.png) if result.png else ""
         self.last_png = png
+        log = os.path.abspath(result.log) if result.log else ""
         self.add_log(f"done: {result.pixels} pixels, {result.bad} bad, saved {png}")
+        self.add_log(f"run log: {log}")
         self.send_to_designer({"type": "done", "png": png, "run_dir": os.path.abspath(result.run_dir),
-                               "bad": result.bad})
+                               "log": log, "bad": result.bad})
 
     def _on_error(self, message):
         self.last_error = message

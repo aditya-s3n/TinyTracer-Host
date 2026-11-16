@@ -120,7 +120,7 @@ def test_demo_scene_renders_through_the_sim_pipe(tmp_path, demo_words):
     run = Path(result.run_dir)
     assert sorted(p.name for p in run.iterdir()) == [
         "events.jsonl", "raw_bytes.log", "render.png", "render_linear.npy", "render_raw.png",
-        "scene.txt", "sram.hex"]
+        "run_log.txt", "scene.txt", "sram.hex"]
     assert (run / "scene.txt").read_text() == DEMO.read_text()
     assert scene_compiler.parse_hex_dump((run / "sram.hex").read_text()) == demo_words
 

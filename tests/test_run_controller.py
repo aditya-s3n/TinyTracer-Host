@@ -404,14 +404,14 @@ def test_make_run_dir_does_not_overwrite(tmp_path):
 
 def test_run_folder_contents(tmp_path, scene_text):
     """After a run the folder holds scene.txt, sram.hex, raw_bytes.log, events.jsonl, render.png,
-    render_raw.png and render_linear.npy."""
+    render_raw.png, render_linear.npy and run_log.txt."""
     ctl, _, _ = make_controller()
     ctl.check_scene(scene_text)
     result = ctl.render_blocking(settings(tmp_path))
 
     assert set(os.listdir(result.run_dir)) == {
         "scene.txt", "sram.hex", "raw_bytes.log", "events.jsonl",
-        "render.png", "render_raw.png", "render_linear.npy"}
+        "render.png", "render_raw.png", "render_linear.npy", "run_log.txt"}
 
     with open(os.path.join(result.run_dir, "scene.txt")) as f:
         assert f.read() == scene_text
