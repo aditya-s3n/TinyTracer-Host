@@ -77,8 +77,9 @@ struct Surface {
     object: i32,   // index of the object in the scene, -2 for the ground
 }
 
+// The chip's sky (Rendering Flow 5h): horizon + (top - horizon) x D_z, with D_z below 0 counted as 0.
 fn sky(d: vec3f) -> vec3f {
-    let t = 0.5 * (d.z + 1.0);
+    let t = clamp(d.z, 0.0, 1.0);
     return mix(g.sky_horizon.rgb, g.sky_top.rgb, t) * g.sky_horizon.w;
 }
 
@@ -163,9 +164,12 @@ fn trace(o: vec3f, d: vec3f) -> Hit {
 
 fn surface(hit: Hit, p: vec3f) -> Surface {
     if hit.id == GROUND {
-        let cell = floor(p.xy / CHECKER_SIZE);
+        // The chip's checker (Rendering Flow 5f). The host moves the scene so the camera
+        // is at x = 0, y = 0, so the squares are counted from the camera, not the world
+        // origin. Odd squares get colour A, even squares colour B.
+        let cell = floor((p.xy - g.origin.xy) / CHECKER_SIZE);
         let odd = abs(cell.x + cell.y) % 2.0;
-        return Surface(mix(g.ground_a.rgb, g.ground_b.rgb, odd), 0.0, 1.0, 0.0, -2);
+        return Surface(mix(g.ground_b.rgb, g.ground_a.rgb, odd), 0.0, 1.0, 0.0, -2);
     }
     var color_metallic = g.spheres[0].color_metallic;
     var rough_emissive = g.spheres[0].rough_emissive;

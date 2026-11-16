@@ -1,0 +1,20 @@
+How to test end to end
+
+1. Automated tests (about 10 seconds, no hardware):
+cd ~/Projects/TinyTracer-Host
+.venv/bin/python -m pytest tests
+cd designer && cargo test
+2. Command line against the stand-in chip:
+cd ~/Projects/TinyTracer-Host
+.venv/bin/python -m tthost render scene_demo.txt --backend sim --port fake
+   It should print 295 of 512 words, a progress bar, 262144 pixels ... 0 bad, and a PNG path under runs/.
+3. Designer through to a PNG:
+cd designer && cargo run --release
+   - Click Start TinyTracer: the Python window opens and the designer shows "connected".
+   - Click Compile: you should see "Scene accepted: 243 of 512 words, 5 BVs".
+   - Tick Use the stand-in chip, then click Render: a progress bar runs, the Python window's live view fills in, and the PNG path appears. The PNG should match the preview's framing, sky and checker (lighting is flatter).
+   - Move a sphere below the ground and Compile again: the error appears with its line number and Render greys out.
+4. Real chip or FPGA:
+.venv/bin/python -m tthost ports
+.venv/bin/python -m tthost render scene_demo.txt --backend chip --port /dev/ttyUSB0
+   Or in the designer, leave the stand-in box unticked and set the backend and port in the Python window. If the picture is wrong, compare sram.hex in the run folder against the RTL's memory, and raw_bytes.log against the wire.

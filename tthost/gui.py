@@ -15,15 +15,19 @@ The frame buffer is a linear float32 numpy array shared with the worker
 thread: only the worker writes it, only the window reads it, and the texture
 is re-uploaded whenever the received pixel count changes.
 
-The run controller (session.py) does not exist yet, so Send starts a
-placeholder worker that fills the frame with a test pattern. Replace
-`_placeholder_render` with a call into the run controller when it lands.
+Send and Cancel go through the run controller (run_controller.py), which
+compiles the scene, drives the UART link and fills the frame buffer. Its
+callbacks arrive on background threads; they only set plain attributes and
+append to the logs, which the window then reads on its next frame.
+
+When the scene designer started this app (--ipc), the same callbacks also send
+it state, progress, done and error messages, and its scene, render and cancel
+messages land in the on_designer_* methods below.
 """
 
 import collections
 import os
 import sys
-import threading
 import time
 
 import numpy as np
@@ -33,18 +37,16 @@ from imgui_bundle import hello_imgui, imgui, immapp, portable_file_dialogs as pf
 from tthost import __version__
 from tthost.framebuffer import FrameBuffer
 from tthost.ipc import DesignerLink
-from tthost.run_controller import compile_text
-from tthost.transport import BACKENDS, DEFAULT_BAUD, IMAGE_SIZE
+from tthost.run_controller import ACTIVE_STATES, DONE, ERROR, IDLE, RunController, RunError, RunSettings
+from tthost.transport import BACKENDS, DEFAULT_BAUD, FAKE_CHIP, IMAGE_SIZE
 
 TOTAL_PIXELS = IMAGE_SIZE * IMAGE_SIZE
 LOG_LINES = 500           # event log lines kept in the panel
 PANEL_WIDTH = 420         # run panel width in pixels
 LOG_WIDTH = 380           # event log column width in pixels
 
-# run controller states (design doc, figure 8.1)
-IDLE, COMPILING, UPLOADING, RENDERING, PROCESSING, DONE, ERROR = (
-    "idle", "compiling", "uploading", "rendering", "processing", "done", "error")
-ACTIVE_STATES = (COMPILING, UPLOADING, RENDERING, PROCESSING)
+GOOD = (0.30, 0.85, 0.40, 1.0)
+BAD = (0.90, 0.35, 0.30, 1.0)
 
 
 class GuiState:
@@ -61,19 +63,23 @@ class GuiState:
         # Set by the pipe handler (tthost/ipc.py) on its reader thread.
         self.designer_connected = False
         self.designer_closed = False   # the designer closed our stdin: time to exit
+        self.link = None               # DesignerLink when started with --ipc
 
         # link and render settings
         self.backend_idx = 0
         self.port = "/dev/ttyUSB0"
         self.baud = DEFAULT_BAUD
 
-        # run
-        self.state = IDLE
+        # run: the controller owns the render; the window shares its frame buffer
         self.fb = FrameBuffer()
+        self.controller = RunController(
+            on_state=self._on_state, on_progress=self._on_progress,
+            on_done=self._on_done, on_error=self._on_error, framebuffer=self.fb)
+        self.check = None              # the compiler's verdict on the loaded scene
         self.start_time = None
         self.end_time = None
-        self.cancel_event = threading.Event()
-        self.worker = None
+        self.last_error = ""
+        self.last_png = ""
 
         # log
         self.log = collections.deque(maxlen=LOG_LINES)
@@ -103,6 +109,10 @@ class GuiState:
         arrow = "<-" if direction == "rx" else "->"
         self.ipc_log.append(f"{t:9.3f}  {arrow} {message}")
 
+    @property
+    def state(self):
+        return self.controller.state
+
     def is_active(self):
         return self.state in ACTIVE_STATES
 
@@ -122,9 +132,56 @@ class GuiState:
             self.add_log(f"load failed: {path}: {e.strerror}")
             return
         self.scene_path = path
-        lines = self.scene_text.count("\n") + 1
-        self.scene_status = f"loaded {os.path.basename(path)} ({lines} lines)"
         self.add_log(f"scene loaded: {path}")
+        self.check_scene(self.scene_text, name=path)
+
+    def check_scene(self, text, rev=None, name="<scene>"):
+        """Compile scene text, remember it for the next render and show the verdict."""
+        self.check = check = self.controller.check_scene(text, rev=rev, filename=name)
+        label = os.path.basename(name) if not name.startswith("<") else "scene"
+        if check.ok:
+            self.scene_status = f"{label}: {check.words} of 512 words, {check.bvs} BVs"
+            self.add_log(f"compiled: {check.words} words, {check.bvs} BVs")
+        else:
+            self.scene_status = f"{label}: {len(check.errors)} error(s), see the event log"
+        for error in check.errors:
+            where = f"line {error['line']}: " if error.get("line") else ""
+            self.add_log(f"scene error: {where}{error['rule']}")
+        for warning in check.warnings:
+            self.add_log(f"scene warning: {warning}")
+        return check
+
+    # -- run controller callbacks (called on the run worker / serial reader threads) --
+
+    def _on_state(self, state):
+        self.add_log(f"state: {state}")
+        if state in (IDLE, DONE, ERROR) and self.start_time is not None and self.end_time is None:
+            self.end_time = time.monotonic()
+        self.send_to_designer({"type": "state", "state": state})
+
+    def _on_progress(self, progress):
+        if progress.row % 32 == 31:
+            self.add_log(f"row {progress.row + 1} of {IMAGE_SIZE}")
+        eta = None if progress.eta_s is None else round(progress.eta_s, 1)
+        self.send_to_designer({"type": "progress", "row": progress.row, "pixels": progress.pixels,
+                               "eta_s": eta, "bad": progress.bad})
+
+    def _on_done(self, result):
+        # Absolute paths: the designer may not share this app's working directory.
+        png = os.path.abspath(result.png) if result.png else ""
+        self.last_png = png
+        self.add_log(f"done: {result.pixels} pixels, {result.bad} bad, saved {png}")
+        self.send_to_designer({"type": "done", "png": png, "run_dir": os.path.abspath(result.run_dir),
+                               "bad": result.bad})
+
+    def _on_error(self, message):
+        self.last_error = message
+        self.add_log(f"error: {message}")
+        self.send_to_designer({"type": "error", "message": message})
+
+    def send_to_designer(self, message):
+        if self.link is not None and self.link.connected:
+            self.link.send(message)
 
     # -- scene designer link (called on the pipe reader thread) ---------------
 
@@ -134,11 +191,26 @@ class GuiState:
             return {"errors": [{"line": None, "rule": "a render is running; scene not loaded"}]}
         self.scene_text = text
         self.scene_path = ""
-        lines = text.count("\n") + 1
-        self.scene_status = f"from scene designer (rev {rev}, {lines} lines)"
         self.add_log(f"scene received from designer: rev {rev}")
-        _, report = compile_text(text, "<designer>")
-        return {key: report[key] for key in ("words", "bvs", "errors", "warnings")}
+        check = self.check_scene(text, rev=rev, name="designer.txt")
+        return {"words": check.words, "bvs": check.bvs, "errors": check.errors, "warnings": check.warnings}
+
+    def on_designer_render(self, message):
+        """A "render" message arrived: start a render of the last scene. Returns an error text or None.
+
+        The link settings (backend, port, baud) are the ones chosen in this window,
+        unless the message names a backend (and port), which then replace them.
+        """
+        backend = message.get("backend")
+        if backend is not None:
+            if backend not in BACKENDS:
+                return f"unknown backend {backend!r}; expected one of {', '.join(BACKENDS)}"
+            self.backend_idx = BACKENDS.index(backend)
+            self.port = message.get("port") or ""
+        return start_render(self, spp=message.get("spp"), passes=message.get("passes") or 1)
+
+    def on_designer_cancel(self):
+        cancel_render(self)
 
     def on_designer_connected(self):
         self.designer_connected = True
@@ -151,53 +223,30 @@ class GuiState:
 
 # -- run control ----------------------------------------------------------------
 
-def start_render(s):
-    s.fb.clear()
-    s.cancel_event.clear()
+def start_render(s, spp=None, passes=1):
+    """Render the loaded scene with the link settings from the window.
+
+    Returns None when the run started, or the reason it could not (also shown in the window).
+    """
+    settings = RunSettings(backend=BACKENDS[s.backend_idx], port=s.port.strip() or None, baud=s.baud,
+                           spp=spp, passes=passes)
+    s.add_log(f"render: backend={settings.backend} port={settings.port} baud={settings.baud}")
+    try:
+        s.controller.render(settings)
+    except RunError as e:
+        s.last_error = str(e)
+        s.add_log(f"render refused: {e}")
+        return str(e)
+    s.last_error = ""
+    s.last_png = ""
     s.start_time = time.monotonic()
     s.end_time = None
-    s.add_log(f"render: backend={BACKENDS[s.backend_idx]} port={s.port} baud={s.baud}")
-    s.worker = threading.Thread(target=_placeholder_render, args=(s,), daemon=True)
-    s.worker.start()
+    return None
 
 
 def cancel_render(s):
-    s.cancel_event.set()
     s.add_log("cancel requested")
-
-
-def _placeholder_render(s):
-    """Stand-in for the run controller: walks the states and fills a test pattern row by row."""
-    s.state = COMPILING
-    s.add_log("state: compiling")
-    time.sleep(0.2)
-    s.state = UPLOADING
-    s.add_log("state: uploading")
-    time.sleep(0.2)
-    s.state = RENDERING
-    s.add_log("state: rendering")
-
-    xs = np.arange(IMAGE_SIZE, dtype=np.float32)
-    for y in range(IMAGE_SIZE):
-        if s.cancel_event.is_set():
-            s.state = IDLE
-            s.end_time = time.monotonic()
-            s.add_log(f"cancelled at row {y}")
-            return
-        row = s.fb.pixels[y]
-        row[:, 0] = xs / IMAGE_SIZE * 255
-        row[:, 1] = y / IMAGE_SIZE * 255
-        row[:, 2] = ((xs // 32 + y // 32) % 2) * 128 + 64
-        s.fb.count += IMAGE_SIZE
-        s.add_log(f"row {y}")
-        time.sleep(0.01)
-
-    s.state = PROCESSING
-    s.add_log("state: processing")
-    time.sleep(0.2)
-    s.state = DONE
-    s.end_time = time.monotonic()
-    s.add_log(f"frame_end pixels={s.fb.count} expected={TOTAL_PIXELS} bad={int(s.fb.bad.sum())}")
+    s.controller.cancel()
 
 
 # -- panels ------------------------------------------------------------------------
@@ -205,9 +254,9 @@ def _placeholder_render(s):
 def draw_designer_status(s):
     """One line under the scene row: is the scene designer connected over the pipes?"""
     if s.designer_connected:
-        color, label = imgui.ImVec4(0.30, 0.85, 0.40, 1.0), "connected"
+        color, label = imgui.ImVec4(*GOOD), "connected"
     else:
-        color, label = imgui.ImVec4(0.85, 0.30, 0.30, 1.0), "not connected"
+        color, label = imgui.ImVec4(*BAD), "not connected"
     imgui.text("Scene designer:")
     imgui.same_line()
     imgui.text_colored(color, label)
@@ -249,20 +298,27 @@ def draw_loading_section(s):
     _, s.backend_idx = imgui.combo("Backend", s.backend_idx, list(BACKENDS))
     imgui.set_next_item_width(-80)
     _, s.port = imgui.input_text("Port", s.port)
+    if imgui.is_item_hovered():
+        imgui.set_tooltip("chip: serial port, e.g. /dev/ttyUSB0\n"
+                          f"sim: program to run, or '{FAKE_CHIP}' for the stand-in chip\n"
+                          "rtl: pseudo-terminal path\n"
+                          "replay: a raw_bytes.log from an earlier run")
     imgui.set_next_item_width(-80)
     _, s.baud = imgui.input_int("Baud", s.baud, 0)
+    if imgui.small_button("Use stand-in chip (no hardware)"):
+        s.backend_idx, s.port = BACKENDS.index("sim"), FAKE_CHIP
     imgui.end_disabled()
 
 
 def draw_send_section(s):
     imgui.separator_text("Render")
-    can_send = bool(s.scene_text) and not s.is_active()
-    imgui.begin_disabled(not can_send)
+    scene_ok = s.check is not None and s.check.ok
+    imgui.begin_disabled(not scene_ok or s.is_active())
     if imgui.button("Send", imgui.ImVec2(120, 0)):
         start_render(s)
     imgui.end_disabled()
-    if not s.scene_text and imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
-        imgui.set_tooltip("Load a scene first")
+    if not scene_ok and imgui.is_item_hovered(imgui.HoveredFlags_.allow_when_disabled):
+        imgui.set_tooltip("Load a scene that compiles without errors first")
     imgui.same_line()
     imgui.begin_disabled(not s.is_active())
     if imgui.button("Cancel", imgui.ImVec2(120, 0)):
@@ -270,6 +326,15 @@ def draw_send_section(s):
     imgui.end_disabled()
     imgui.same_line()
     imgui.text(f"state: {s.state}")
+
+    if s.last_error:
+        imgui.push_text_wrap_pos(0.0)
+        imgui.text_colored(imgui.ImVec4(*BAD), s.last_error)
+        imgui.pop_text_wrap_pos()
+    elif s.last_png:
+        imgui.push_text_wrap_pos(0.0)
+        imgui.text_colored(imgui.ImVec4(*GOOD), f"saved {s.last_png}")
+        imgui.pop_text_wrap_pos()
 
     count = s.fb.count
     elapsed = s.elapsed()
@@ -414,11 +479,14 @@ def run(scene_path=None, ipc_out=None):
     if scene_path:
         state.load_scene(scene_path)
     if ipc_out is not None:
-        DesignerLink(sys.stdin, ipc_out, version=__version__,
-                     on_scene=state.on_designer_scene,
-                     on_connected=state.on_designer_connected,
-                     on_closed=state.on_designer_closed,
-                     on_log=state.add_ipc_log).start()
+        state.link = DesignerLink(sys.stdin, ipc_out, version=__version__,
+                                  on_scene=state.on_designer_scene,
+                                  on_render=state.on_designer_render,
+                                  on_cancel=state.on_designer_cancel,
+                                  on_connected=state.on_designer_connected,
+                                  on_closed=state.on_designer_closed,
+                                  on_log=state.add_ipc_log)
+        state.link.start()
     params = hello_imgui.RunnerParams()
     params.app_window_params.window_title = "TinyTracer"
     params.app_window_params.window_geometry.size = (1600, 820)
@@ -428,4 +496,6 @@ def run(scene_path=None, ipc_out=None):
     params.imgui_window_params.default_imgui_window_type = hello_imgui.DefaultImGuiWindowType.no_default_window
     params.callbacks.show_gui = lambda: draw(state)
     immapp.run(params)
-    state.cancel_event.set()
+    # Window closed: stop a render in progress so the chip is reset and the logs are closed.
+    state.controller.cancel()
+    state.controller.wait(3.0)

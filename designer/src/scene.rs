@@ -3,7 +3,9 @@
 //! Conventions follow the design doc: z is up, the ground is the plane z = 0,
 //! positions stay within +/-256 and the field of view is at most 90 degrees.
 //! Colours are stored the way the colour pickers show them (sRGB, 0..1) and
-//! converted to linear light only when they are sent to the shader.
+//! converted to linear light when they are sent to the shader or written to
+//! the scene file: the chip does plain arithmetic on colour values, so the
+//! file holds linear numbers and the host applies the sRGB curve to the result.
 
 use glam::Vec3;
 
@@ -245,8 +247,9 @@ impl Camera {
     }
 }
 
-/// Sky gradient in the style of "Ray Tracing in One Weekend": blend from the
-/// horizon colour to the top colour by how far up the ray points.
+/// Sky gradient: the horizon colour for a level ray, blending to the top colour
+/// for a ray pointing straight up. Rays pointing down get the horizon colour.
+/// This is the chip's own formula, so the preview's sky matches the render.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sky {
     /// sRGB, 0..1.
@@ -282,9 +285,10 @@ impl Default for Scene {
             camera: Camera { pos: Vec3::new(5.0, 5.0, 12.0), yaw_deg: 45.0, pitch_deg: -12.0, fov_deg: 90.0 },
             spp: 32,
             sky: Sky {
-                // (1, 1, 1) and (0.5, 0.7, 1.0) in linear light: the book's sky.
+                // (1, 1, 1) and (0.5, 0.7, 1.0) in linear light: the sky colours of
+                // "Ray Tracing in One Weekend".
                 horizon: [1.0, 1.0, 1.0],
-                top: [0.735, 0.854, 1.0],
+                top: [0.7354, 0.854, 1.0],
                 strength: 1.0,
             },
             ground: [[0.80, 0.80, 0.78], [0.47, 0.47, 0.51]],
@@ -409,7 +413,7 @@ impl Scene {
         let cam = &self.camera;
         let mut out = String::new();
         out += "# TinyTracer scene, written by the scene designer.\n";
-        out += "# z is up. Colours are 0-255. Positions must stay within +-256.\n";
+        out += "# z is up. Colours are 0-255, linear light. Positions must stay within +-256.\n";
         out += "#   sphere x y z r               material R G B strength\n";
         out += "#   tri    3 corners x y z       material R G B strength\n";
         out += "#   quad   4 corners in order    material R G B strength   (host makes 2 triangles)\n";
@@ -421,10 +425,10 @@ impl Scene {
             num(cam.pos.x), num(cam.pos.y), num(cam.pos.z), num(cam.yaw_deg), num(cam.pitch_deg), num(cam.fov_deg),
         );
         // The file has no sky strength, so it is folded into the two colours.
-        let sky = |c: [f32; 3]| rgb255(c.map(|v| linear_to_srgb(srgb_to_linear(v) * self.sky.strength)));
+        let sky = |c: [f32; 3]| linear255(c.map(|v| srgb_to_linear(v) * self.sky.strength));
         out += &format!("sky     {}  {}\n", sky(self.sky.horizon), sky(self.sky.top));
-        out += &format!("ground  {}\n", rgb255(self.ground[0]));
-        out += &format!("checker {}\n", rgb255(self.ground[1]));
+        out += &format!("ground  {}\n", linear255(srgb_to_linear3(self.ground[0])));
+        out += &format!("checker {}\n", linear255(srgb_to_linear3(self.ground[1])));
 
         for object in &self.objects {
             let (material, strength) = object.material.chip_material();
@@ -439,7 +443,7 @@ impl Scene {
             out += &format!(
                 "{} {geometry}   {material}  {}  {}\n",
                 object.shape.kind().keyword(),
-                rgb255(object.material.color),
+                linear255(srgb_to_linear3(object.material.color)),
                 num(strength),
             );
         }
@@ -464,8 +468,8 @@ fn points(corners: &[Vec3]) -> String {
     corners.iter().map(|&p| point(p)).collect::<Vec<_>>().join("  ")
 }
 
-/// An sRGB colour (0..1) as three 0-255 integers.
-fn rgb255(c: [f32; 3]) -> String {
+/// A linear-light colour (0..1) as the three 0-255 integers the chip works with.
+fn linear255(c: [f32; 3]) -> String {
     let [r, g, b] = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
     format!("{r} {g} {b}")
 }
@@ -512,11 +516,6 @@ pub fn ray_triangle(origin: Vec3, dir: Vec3, [v0, v1, v2]: &Triangle) -> Option<
 /// sRGB-encoded value (0..1) to linear light.
 pub fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
-}
-
-/// Linear light to an sRGB-encoded value (design doc 4.5).
-pub fn linear_to_srgb(c: f32) -> f32 {
-    if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
 }
 
 pub fn srgb_to_linear3(c: [f32; 3]) -> [f32; 3] {
@@ -683,16 +682,24 @@ mod tests {
         assert_eq!(num(-12.0), "-12");
     }
 
+    /// The sRGB picker value whose linear-light value is `linear` / 255.
+    fn picker(linear: [u8; 3]) -> [f32; 3] {
+        linear.map(|v| {
+            let c = v as f32 / 255.0;
+            if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+        })
+    }
+
     #[test]
     fn to_txt_matches_the_scene_file_format() {
         let mut scene = Scene::default();
-        scene.sky.horizon = [235.0 / 255.0, 240.0 / 255.0, 1.0];
-        scene.sky.top = [110.0 / 255.0, 160.0 / 255.0, 1.0];
-        scene.ground = [[205.0 / 255.0, 205.0 / 255.0, 200.0 / 255.0], [120.0 / 255.0, 120.0 / 255.0, 130.0 / 255.0]];
+        scene.sky.horizon = picker([235, 240, 255]);
+        scene.sky.top = picker([110, 160, 255]);
+        scene.ground = [picker([205, 205, 200]), picker([120, 120, 130])];
         scene.objects.truncate(1);
-        scene.objects[0].material.color = [220.0 / 255.0, 60.0 / 255.0, 50.0 / 255.0];
+        scene.objects[0].material.color = picker([220, 60, 50]);
         let v = Vec3::new;
-        let glow = Material { color: [1.0, 170.0 / 255.0, 80.0 / 255.0], metallic: 0.0, roughness: 0.5, emissive: 8.0 };
+        let glow = Material { color: picker([255, 170, 80]), metallic: 0.0, roughness: 0.5, emissive: 8.0 };
         let mirror = Material { color: [1.0, 1.0, 1.0], metallic: 1.0, roughness: 0.0, emissive: 0.0 };
         scene.objects.push(Object {
             name: "Lamp\n2".to_owned(),
@@ -709,7 +716,9 @@ mod tests {
             shape: Shape::Quad([v(54.0, 18.0, 0.5), v(62.0, 24.0, 0.5), v(62.0, 24.0, 7.0), v(54.0, 18.0, 7.0)]),
             material: glow,
         });
-        scene.objects.push(plain(Shape::Box { a: v(30.0, 52.0, 0.0), b: v(40.0, 62.0, 10.0) }));
+        let mut blue_box = plain(Shape::Box { a: v(30.0, 52.0, 0.0), b: v(40.0, 62.0, 10.0) });
+        blue_box.material.color = picker([70, 110, 230]);
+        scene.objects.push(blue_box);
 
         // Only the lines the compiler reads: no comments, no blanks.
         let txt = scene.to_txt();
@@ -727,7 +736,7 @@ mod tests {
                 "sphere 26 18 1.5  1.5   glow  255 170 80  8",
                 "tri 12 48 0  22 48 0  17 53 9   mirror  255 255 255  0",
                 "quad 54 18 0.5  62 24 0.5  62 24 7  54 18 7   glow  255 170 80  8",
-                "box 30 52 0  40 62 10   matte  204 204 204  0",
+                "box 30 52 0  40 62 10   matte  70 110 230  0",
             ]
         );
         // A newline in a name must not break out of its comment line.
@@ -735,12 +744,24 @@ mod tests {
     }
 
     #[test]
+    fn file_colours_are_linear_light() {
+        let mut scene = Scene { objects: Vec::new(), ..Scene::default() };
+        // sRGB mid grey (188) is half the light: 128 of 255.
+        scene.ground = [[188.0 / 255.0; 3], [0.0; 3]];
+        let txt = scene.to_txt();
+        assert!(txt.contains("ground  128 128 128\n"), "{txt}");
+        assert!(txt.contains("checker 0 0 0\n"));
+        // The default sky is (1, 1, 1) and (0.5, 0.7, 1.0) in linear light.
+        assert!(txt.contains("sky     255 255 255  128 178 255\n"), "{txt}");
+    }
+
+    #[test]
     fn sky_strength_is_folded_into_the_sky_colours() {
         let mut scene = Scene::default();
-        scene.sky.horizon = [0.5, 0.5, 0.5];
-        scene.sky.top = [0.5, 0.5, 0.5];
-        scene.sky.strength = 0.0;
-        assert!(scene.to_txt().contains("sky     0 0 0  0 0 0\n"));
+        scene.sky.horizon = [1.0, 1.0, 1.0];
+        scene.sky.top = [1.0, 1.0, 1.0];
+        scene.sky.strength = 0.5;
+        assert!(scene.to_txt().contains("sky     128 128 128  128 128 128\n"));
         scene.sky.strength = 100.0;
         assert!(scene.to_txt().contains("sky     255 255 255  255 255 255\n"));
     }

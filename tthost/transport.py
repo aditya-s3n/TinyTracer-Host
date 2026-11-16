@@ -26,6 +26,7 @@ import json
 import os
 import select
 import subprocess
+import sys
 import time
 
 OBJECT_START = 0x01
@@ -38,6 +39,7 @@ SRAM_WORDS = 512 # an upload is at most one OBJECT message per SRAM word
 BYTES_PER_OBJECT = 5  # OBJECT message size before escapes
 BITS_PER_BYTE = 10 # 8N1: start bit + 8 data bits + stop bit
 BACKENDS = ("chip", "sim", "rtl", "replay")
+FAKE_CHIP = "fake"   # as the "sim" backend's port: run the stand-in chip in tthost/fake_chip.py
 
 
 # Logging
@@ -86,11 +88,25 @@ class SimLink:
 
     Bytes written go to the sim's stdin; bytes read come from its stdout.
     `read` waits up to `timeout` seconds, like a pyserial port. POSIX only.
+
+    `sim_path` is the program to run. FAKE_CHIP runs the stand-in chip that
+    ships with the host (tthost/fake_chip.py), and a path ending in .py is run
+    with this Python.
     """
 
     def __init__(self, sim_path, timeout=1.0):
         self.timeout = timeout
-        self.proc = subprocess.Popen([sim_path], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+        if sim_path == FAKE_CHIP:
+            command = [sys.executable, "-m", "tthost.fake_chip"]
+        elif str(sim_path).endswith(".py"):
+            command = [sys.executable, str(sim_path)]
+        else:
+            command = [sim_path]
+        # The stand-in chip is a module of this package, so it must be able to import it.
+        package_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, env.get("PYTHONPATH")]))
+        self.proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0, env=env)
         self._fd = self.proc.stdout.fileno()
         os.set_blocking(self._fd, False)
         self._buffer = bytearray()

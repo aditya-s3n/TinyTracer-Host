@@ -14,3 +14,6 @@ venv/
 
 # Rust build output (scene designer)
 designer/target/
+
+# Render output: one folder per run (PNG, logs, scene, memory image)
+runs/

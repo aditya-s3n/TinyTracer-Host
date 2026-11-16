@@ -35,7 +35,6 @@ with transport + receive, and the small pipeline at the bottom of this file
 import hashlib
 import os
 import subprocess
-import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -600,40 +599,9 @@ def compile_text(text, filename="<scene>"):
 
     Returns (words, report) where report has words, bvs, errors, warnings and
     hex (the sram.hex text). words is None when there are errors. Never raises
-    for a bad scene: the exception becomes one error entry.
+    for a bad scene: every broken rule is one entry in report["errors"].
     """
-    fd, path = tempfile.mkstemp(suffix=".txt", prefix="tthost_scene_")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-
-        try:
-            out = scene_compiler.compile_scene(path)
-        except Exception as e:
-            return None, _error_report(getattr(e, "line", None), str(e))
-    finally:
-        os.remove(path)
-
-    if out is None:
-        return None, _error_report(None, "scene compiler is not implemented yet")
-
-    words, warnings, metadata = out
-    metadata = metadata or {}
-
-    hex_text = scene_compiler.hex_dump(words) or simple_hex_dump(words)
-
-    return list(words), {
-        "words": metadata.get("words", len(words)),
-        "bvs": metadata.get("bvs", 0),
-        "errors": [],
-        "warnings": list(warnings or []),
-        "hex": hex_text,
-    }
-
-
-def _error_report(line, rule):
-    """A compiler report with one error and nothing else."""
-    return {"words": 0, "bvs": 0, "errors": [{"line": line, "rule": rule}], "warnings": [], "hex": ""}
+    return scene_compiler.compile_text(text, filename)
 
 
 def simple_hex_dump(words):

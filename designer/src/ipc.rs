@@ -5,8 +5,8 @@
 //! A background thread reads the app's replies and hands them to the main
 //! thread through a channel, so the UI never waits on the pipe.
 //!
-//! Handled so far: hello / ready, scene / checked and error. The render
-//! messages (render, cancel, state, progress, done) are not sent or read yet.
+//! The designer sends hello, scene, render and cancel. The app answers with
+//! ready, checked, state, progress, done and error.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -30,6 +30,17 @@ const EXIT_GRACE: Duration = Duration::from_millis(1500);
 enum ToApp<'a> {
     Hello { protocol: u32 },
     Scene { rev: u64, text: &'a str },
+    /// Render the scene sent last. Without a backend the app uses the link
+    /// settings chosen in its own window.
+    Render {
+        spp: u8,
+        passes: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        backend: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        port: Option<&'a str>,
+    },
+    Cancel,
 }
 
 /// Messages the app sends. Types this build does not know are ignored, so the
@@ -43,6 +54,17 @@ enum FromApp {
         tthost: String,
     },
     Checked(Checked),
+    /// idle, compiling, uploading, rendering, processing, resetting, done or error.
+    State {
+        state: String,
+    },
+    /// Sent once per finished image row.
+    Progress(Progress),
+    Done {
+        png: String,
+        #[serde(default)]
+        bad: u32,
+    },
     Error {
         message: String,
     },
@@ -63,6 +85,28 @@ pub struct Checked {
     #[serde(default)]
     pub warnings: Vec<String>,
 }
+
+impl Checked {
+    pub fn ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+#[derive(Deserialize, Debug, PartialEq, Clone)]
+pub struct Progress {
+    pub row: u32,
+    pub pixels: u32,
+    /// Seconds left, once the app can tell.
+    pub eta_s: Option<f32>,
+    #[serde(default)]
+    pub bad: u32,
+}
+
+/// Pixels in one chip frame.
+pub const TOTAL_PIXELS: u32 = 512 * 512;
+/// What `render` asks for when the stand-in chip box is ticked: the app's "sim"
+/// backend running the fake chip that ships with it.
+const STAND_IN_BACKEND: (&str, &str) = ("sim", "fake");
 
 #[derive(Deserialize, Debug, PartialEq, Clone)]
 pub struct CheckError {
@@ -127,6 +171,13 @@ pub struct TinyTracer {
     pub checked: Option<Checked>,
     /// The last `error` message from the app.
     pub app_error: Option<String>,
+    /// Render on the app's stand-in chip instead of the link chosen in its window.
+    pub use_stand_in_chip: bool,
+    /// The app's run state: "idle", "rendering", ... Empty until it reports one.
+    pub run_state: String,
+    pub progress: Option<Progress>,
+    /// Where the last finished render was saved, and its bad-pixel count.
+    pub done: Option<(String, u32)>,
 }
 
 impl TinyTracer {
@@ -147,7 +198,45 @@ impl TinyTracer {
             status: Status::NotRunning,
             checked: None,
             app_error: None,
+            use_stand_in_chip: false,
+            run_state: String::new(),
+            progress: None,
+            done: None,
         }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        matches!(self.status, Status::Connected { .. })
+    }
+
+    /// True while the app is busy with a render.
+    pub fn is_rendering(&self) -> bool {
+        matches!(self.run_state.as_str(), "compiling" | "uploading" | "rendering" | "processing" | "resetting")
+    }
+
+    /// Render is allowed once the app has accepted the scene sent last and is not busy.
+    pub fn can_render(&self) -> bool {
+        self.is_connected() && !self.is_rendering() && self.checked.as_ref().is_some_and(Checked::ok)
+    }
+
+    /// Ask the app to render the scene sent by the last Compile.
+    pub fn render(&mut self, scene: &Scene) {
+        if !self.can_render() {
+            return;
+        }
+        self.app_error = None;
+        self.progress = None;
+        self.done = None;
+        let (backend, port) = match self.use_stand_in_chip {
+            true => (Some(STAND_IN_BACKEND.0), Some(STAND_IN_BACKEND.1)),
+            false => (None, None),
+        };
+        self.send(&ToApp::Render { spp: scene.spp, passes: 1, backend, port });
+    }
+
+    /// Ask the app to stop the current render and reset the chip.
+    pub fn cancel(&mut self) {
+        self.send(&ToApp::Cancel);
     }
 
     pub fn is_running(&self) -> bool {
@@ -169,7 +258,7 @@ impl TinyTracer {
             Err(e) => Err(format!("Could not write {}: {e}", path.display())),
         });
 
-        if matches!(self.status, Status::Connected { .. }) {
+        if self.is_connected() && !self.is_rendering() {
             self.rev += 1;
             self.checked = None;
             self.app_error = None;
@@ -184,6 +273,9 @@ impl TinyTracer {
         }
         self.checked = None;
         self.app_error = None;
+        self.run_state.clear();
+        self.progress = None;
+        self.done = None;
 
         // Prefer the project's virtual environment, where imgui-bundle is installed.
         let venv_python = self.root.join(".venv").join("bin").join("python");
@@ -230,6 +322,7 @@ impl TinyTracer {
             running.shut_down();
         }
         self.status = Status::NotRunning;
+        self.run_state.clear();
     }
 
     /// Handle everything the app has sent since the last frame. Call once per frame.
@@ -262,6 +355,9 @@ impl TinyTracer {
             // A reply to an older scene says nothing about the current one.
             Ok(FromApp::Checked(checked)) if checked.rev == self.rev => self.checked = Some(checked),
             Ok(FromApp::Checked(_)) | Ok(FromApp::Unknown) => {}
+            Ok(FromApp::State { state }) => self.run_state = state,
+            Ok(FromApp::Progress(progress)) => self.progress = Some(progress),
+            Ok(FromApp::Done { png, bad }) => self.done = Some((png, bad)),
             Ok(FromApp::Error { message }) => self.app_error = Some(message),
             Err(e) => eprintln!("designer: ignoring a line from the TinyTracer app ({e}): {line}"),
         }
@@ -281,6 +377,7 @@ impl TinyTracer {
         if let Some(running) = self.running.take() {
             running.shut_down();
         }
+        self.run_state.clear();
         self.status = Status::Failed(reason);
     }
 }
@@ -325,8 +422,46 @@ mod tests {
 
     #[test]
     fn unknown_message_types_are_ignored() {
-        let msg: FromApp = serde_json::from_str(r#"{"type":"progress","row":0,"pixels":512}"#).unwrap();
+        let msg: FromApp = serde_json::from_str(r#"{"type":"from_the_future","x":1}"#).unwrap();
         assert_eq!(msg, FromApp::Unknown);
+    }
+
+    #[test]
+    fn render_messages_match_the_design_doc() {
+        let plain = ToApp::Render { spp: 32, passes: 1, backend: None, port: None };
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"type":"render","spp":32,"passes":1}"#);
+        let stand_in = ToApp::Render { spp: 8, passes: 1, backend: Some("sim"), port: Some("fake") };
+        assert_eq!(
+            serde_json::to_string(&stand_in).unwrap(),
+            r#"{"type":"render","spp":8,"passes":1,"backend":"sim","port":"fake"}"#
+        );
+        assert_eq!(serde_json::to_string(&ToApp::Cancel).unwrap(), r#"{"type":"cancel"}"#);
+    }
+
+    #[test]
+    fn a_render_is_followed_from_state_to_done() {
+        let mut tt = TinyTracer::new();
+        tt.status = Status::Connected { tthost: String::new() };
+        assert!(!tt.can_render(), "nothing compiled yet");
+        tt.rev = 1;
+        tt.handle_line(r#"{"type":"checked","rev":1,"words":43,"bvs":1,"errors":[],"warnings":[]}"#);
+        assert!(tt.can_render());
+
+        tt.handle_line(r#"{"type":"state","state":"rendering"}"#);
+        assert!(tt.is_rendering() && !tt.can_render());
+        tt.handle_line(r#"{"type":"progress","row":0,"pixels":512,"eta_s":null,"bad":0}"#);
+        tt.handle_line(r#"{"type":"progress","row":1,"pixels":1024,"eta_s":401.5,"bad":2}"#);
+        let progress = tt.progress.clone().unwrap();
+        assert_eq!((progress.row, progress.pixels, progress.eta_s, progress.bad), (1, 1024, Some(401.5), 2));
+
+        tt.handle_line(r#"{"type":"state","state":"done"}"#);
+        tt.handle_line(r#"{"type":"done","png":"/runs/x/render.png","run_dir":"/runs/x","bad":2}"#);
+        assert_eq!(tt.done, Some(("/runs/x/render.png".to_owned(), 2)));
+        assert!(tt.can_render(), "ready for the next render");
+
+        // A scene the app rejected cannot be rendered.
+        tt.handle_line(r#"{"type":"checked","rev":1,"errors":[{"line":3,"rule":"x"}]}"#);
+        assert!(!tt.can_render());
     }
 
     #[test]

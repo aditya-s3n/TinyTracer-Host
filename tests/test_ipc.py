@@ -60,3 +60,19 @@ def test_failing_scene_handler_reports_an_error():
 
     _, replies = run_session(['{"type":"scene","rev":1,"text":""}'], on_scene=on_scene)
     assert replies == [{"type": "error", "message": "scene handler failed: boom"}]
+
+
+def test_render_and_cancel_reach_their_handlers():
+    seen = []
+    _, replies = run_session(['{"type":"render","spp":8,"passes":1}', '{"type":"cancel"}'],
+                             on_render=lambda m: seen.append(("render", m["spp"])),
+                             on_cancel=lambda: seen.append(("cancel",)))
+    assert seen == [("render", 8), ("cancel",)]
+    assert replies == []
+
+
+def test_refused_render_is_reported_as_an_error():
+    _, replies = run_session(['{"type":"render"}'], on_render=lambda m: "no scene has been compiled yet")
+    assert replies == [{"type": "error", "message": "no scene has been compiled yet"}]
+    _, replies = run_session(['{"type":"render"}'])
+    assert replies[0]["type"] == "error"

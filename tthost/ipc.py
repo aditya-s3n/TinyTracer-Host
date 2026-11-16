@@ -8,10 +8,17 @@ stdout piped. Messages are JSON lines: one JSON object per line, each with a
     app -> designer   ready {protocol, tthost}
     designer -> app   scene {rev, text}       full scene .txt text
     app -> designer   checked {rev, words, bvs, errors, warnings}
-    app -> designer   error {message}         a message could not be handled
+    designer -> app   render {spp, passes, backend, port}   render the last scene sent; backend
+                                              and port are optional (default: the window's)
+    designer -> app   cancel                  stop the current render
+    app -> designer   state {state}           idle, compiling, uploading, rendering, ...
+    app -> designer   progress {row, pixels, eta_s, bad}    once per finished row
+    app -> designer   done {png, run_dir, bad}
+    app -> designer   error {message}         a run failed or a message could not be handled
 
-render / cancel / state / progress / done are in the design doc but not handled
-here yet; like any unknown type they are logged and ignored.
+This module handles the designer's messages and writes whatever it is given;
+the window sends state, progress and done itself, from the run controller's
+callbacks. Unknown types are logged and ignored.
 
 Rules: stdout carries protocol messages only, so call claim_stdout() before
 anything can print. This module never imports the GUI; the window passes
@@ -45,16 +52,21 @@ class DesignerLink:
 
     Callbacks (all optional, called on the reader thread):
         on_scene(rev, text) -> dict   fields for the "checked" reply: words, bvs, errors, warnings
+        on_render(message) -> str     start a render; return why not, or None when it started
+        on_cancel()                   stop the current render
         on_connected()                the hello / ready handshake completed
         on_closed()                   stdin closed: the designer quit or dropped the link
         on_log(direction, line)       every raw line; direction is "rx" or "tx"
     """
 
-    def __init__(self, inp, out, version="", on_scene=None, on_connected=None, on_closed=None, on_log=None):
+    def __init__(self, inp, out, version="", on_scene=None, on_render=None, on_cancel=None,
+                 on_connected=None, on_closed=None, on_log=None):
         self.inp = inp
         self.out = out
         self.version = version
         self.on_scene = on_scene
+        self.on_render = on_render
+        self.on_cancel = on_cancel
         self.on_connected = on_connected
         self.on_closed = on_closed
         self.on_log = on_log
@@ -111,6 +123,11 @@ class DesignerLink:
                 self.on_connected()
         elif kind == "scene":
             self._handle_scene(message)
+        elif kind == "render":
+            self._handle_render(message)
+        elif kind == "cancel":
+            if self.on_cancel:
+                self.on_cancel()
         # Unknown types are ignored (they are already in the log), so either side
         # can add messages without breaking the other.
 
@@ -127,6 +144,17 @@ class DesignerLink:
                 self.send({"type": "error", "message": f"scene handler failed: {e}"})
                 return
         self.send({"type": "checked", "rev": rev, **verdict})
+
+    def _handle_render(self, message):
+        if not self.on_render:
+            self.send({"type": "error", "message": "this app cannot render"})
+            return
+        try:
+            refused = self.on_render(message)
+        except Exception as e:  # a handler bug must not kill the link
+            refused = f"render handler failed: {e}"
+        if refused:
+            self.send({"type": "error", "message": refused})
 
     def _log(self, direction, line):
         if self.on_log:

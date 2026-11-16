@@ -5,7 +5,7 @@
 use eframe::egui;
 use glam::Vec3;
 
-use crate::ipc::{Status, TinyTracer};
+use crate::ipc::{Status, TinyTracer, TOTAL_PIXELS};
 use crate::scene::{
     Object, Scene, Shape, ShapeKind, MAX_EMISSIVE, MAX_FOV_DEG, MAX_PITCH_DEG, MIN_FOV_DEG, POS_LIMIT, SRAM_WORDS,
     VALID_SPP,
@@ -110,10 +110,49 @@ fn tinytracer_section(ui: &mut egui::Ui, scene: &mut Scene, tt: &mut TinyTracer)
                 ui.colored_label(WARNING, format!("Warning: {warning}"));
             }
         }
+        render_rows(ui, scene, tt);
         if let Some(message) = &tt.app_error {
             ui.colored_label(ERROR, format!("App error: {message}"));
         }
     });
+}
+
+/// Render and Cancel, the progress of the render, and where the image went.
+/// Shown only while the TinyTracer app is connected.
+fn render_rows(ui: &mut egui::Ui, scene: &Scene, tt: &mut TinyTracer) {
+    if !tt.is_connected() {
+        return;
+    }
+    ui.checkbox(&mut tt.use_stand_in_chip, "Use the stand-in chip (no hardware)").on_hover_text(
+        "Off: render on the backend and port chosen in the TinyTracer window.\n\
+         On: render on the fake chip that ships with the app, to test the whole path.",
+    );
+    ui.horizontal(|ui| {
+        let render = ui
+            .add_enabled(tt.can_render(), egui::Button::new("Render"))
+            .on_disabled_hover_text("Compile first: the app has to accept the scene.");
+        if render.clicked() {
+            tt.render(scene);
+        }
+        if ui.add_enabled(tt.is_rendering(), egui::Button::new("Cancel")).clicked() {
+            tt.cancel();
+        }
+        if !tt.run_state.is_empty() {
+            ui.weak(&tt.run_state);
+        }
+    });
+
+    if tt.is_rendering() {
+        if let Some(progress) = &tt.progress {
+            let eta = progress.eta_s.map_or(String::new(), |s| format!(", {s:.0} s left"));
+            let text = format!("row {} of 512{eta}", progress.row + 1);
+            ui.add(egui::ProgressBar::new(progress.pixels as f32 / TOTAL_PIXELS as f32).text(text));
+        }
+    }
+    if let Some((png, bad)) = &tt.done {
+        ui.colored_label(GOOD, format!("Rendered ({bad} bad pixels):"));
+        ui.add(egui::Label::new(egui::RichText::new(png).weak()).wrap());
+    }
 }
 
 fn camera_section(ui: &mut egui::Ui, scene: &mut Scene) {
