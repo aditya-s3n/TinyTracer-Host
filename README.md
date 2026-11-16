@@ -11,9 +11,10 @@ cd designer
 cargo run --release
 ```
 
-The right-hand panel edits the camera, sky, ground and spheres. In the view:
+The right-hand panel edits the camera, sky, ground and objects (spheres,
+triangles, quads and boxes). In the view:
 right-drag to look, hold the right button and use WASD/QE to move, scroll to
-change the field of view, click a sphere to select it.
+change the field of view, click an object to select it.
 
 In the TinyTracer section of the panel:
 

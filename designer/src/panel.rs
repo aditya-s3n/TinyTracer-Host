@@ -1,4 +1,4 @@
-//! Side panel: camera, sky and ground, the sphere list, and the selected sphere (design doc 6.3).
+//! Side panel: camera, sky and ground, the object list, and the selected object (design doc 6.3).
 //!
 //! The panel edits the scene it is handed and keeps no state of its own.
 
@@ -7,7 +7,8 @@ use glam::Vec3;
 
 use crate::ipc::{Status, TinyTracer};
 use crate::scene::{
-    Scene, Sphere, MAX_EMISSIVE, MAX_FOV_DEG, MAX_PITCH_DEG, MAX_SPHERES, MIN_FOV_DEG, POS_LIMIT, VALID_SPP,
+    Object, Scene, Shape, ShapeKind, MAX_EMISSIVE, MAX_FOV_DEG, MAX_PITCH_DEG, MIN_FOV_DEG, POS_LIMIT, SRAM_WORDS,
+    VALID_SPP,
 };
 
 const WARNING: egui::Color32 = egui::Color32::from_rgb(230, 160, 40);
@@ -23,18 +24,24 @@ pub fn show(ui: &mut egui::Ui, scene: &mut Scene, selected: &mut Option<usize>, 
 }
 
 /// Three drag boxes on one row for a position, limited to the chip's +/-256 range.
-fn position_row(ui: &mut egui::Ui, pos: &mut Vec3) {
+/// Returns true when a value changed.
+fn position_row(ui: &mut egui::Ui, pos: &mut Vec3) -> bool {
+    xyz_row(ui, pos, -POS_LIMIT..=POS_LIMIT)
+}
+
+fn xyz_row(ui: &mut egui::Ui, v: &mut Vec3, range: std::ops::RangeInclusive<f32>) -> bool {
+    let mut changed = false;
     ui.horizontal(|ui| {
-        for (label, value) in [("x", &mut pos.x), ("y", &mut pos.y), ("z", &mut pos.z)] {
-            ui.add(
-                egui::DragValue::new(value)
-                    .speed(0.1)
-                    .range(-POS_LIMIT..=POS_LIMIT)
-                    .max_decimals(2)
-                    .prefix(format!("{label} ")),
-            );
+        for (label, value) in [("x", &mut v.x), ("y", &mut v.y), ("z", &mut v.z)] {
+            let drag = egui::DragValue::new(value)
+                .speed(0.1)
+                .range(range.clone())
+                .max_decimals(2)
+                .prefix(format!("{label} "));
+            changed |= ui.add(drag).changed();
         }
     });
+    changed
 }
 
 fn grid(ui: &mut egui::Ui, id: &str, contents: impl FnOnce(&mut egui::Ui)) {
@@ -167,30 +174,40 @@ fn sky_section(ui: &mut egui::Ui, scene: &mut Scene) {
 
 fn objects_section(ui: &mut egui::Ui, scene: &mut Scene, selected: &mut Option<usize>) {
     // A stale index can be left behind by a delete; drop it before anything uses it.
-    if selected.is_some_and(|i| i >= scene.spheres.len()) {
+    if selected.is_some_and(|i| i >= scene.objects.len()) {
         *selected = None;
     }
 
     egui::CollapsingHeader::new("Objects").default_open(true).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            let room = scene.spheres.len() < MAX_SPHERES;
-            if ui.add_enabled(room, egui::Button::new("Add sphere")).clicked() {
-                *selected = scene.add_sphere();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Add");
+            for kind in ShapeKind::ALL {
+                let button = ui
+                    .add_enabled(scene.can_add(kind), egui::Button::new(kind.label()))
+                    .on_disabled_hover_text("The preview is full.");
+                if button.clicked() {
+                    *selected = scene.add(kind);
+                }
             }
-            if ui.add_enabled(room && selected.is_some(), egui::Button::new("Duplicate")).clicked() {
+        });
+        ui.horizontal(|ui| {
+            let can_duplicate = selected.is_some_and(|i| scene.can_add(scene.objects[i].shape.kind()));
+            if ui.add_enabled(can_duplicate, egui::Button::new("Duplicate")).clicked() {
                 *selected = selected.and_then(|i| scene.duplicate(i));
             }
             if ui.add_enabled(selected.is_some(), egui::Button::new("Delete")).clicked() {
                 if let Some(i) = selected.take() {
-                    scene.spheres.remove(i);
+                    scene.objects.remove(i);
                 }
             }
         });
-        ui.weak(format!("{} of {MAX_SPHERES} spheres", scene.spheres.len()));
+
+        memory_meter(ui, scene);
 
         egui::ScrollArea::vertical().id_salt("object list").max_height(160.0).show(ui, |ui| {
-            for (i, sphere) in scene.spheres.iter().enumerate() {
-                let label = if sphere.name.is_empty() { "(unnamed)" } else { sphere.name.as_str() };
+            for (i, object) in scene.objects.iter().enumerate() {
+                let name = if object.name.is_empty() { "(unnamed)" } else { object.name.as_str() };
+                let label = format!("{name}  ·  {}", object.shape.kind().keyword());
                 // The index keeps rows with the same name apart.
                 let row = ui.push_id(i, |ui| ui.selectable_label(*selected == Some(i), label));
                 if row.inner.clicked() {
@@ -201,31 +218,47 @@ fn objects_section(ui: &mut egui::Ui, scene: &mut Scene, selected: &mut Option<u
     });
 }
 
+/// How much of the chip's 512 words the scene needs. Triangles are expensive:
+/// 12 words each, so one box costs 144.
+fn memory_meter(ui: &mut egui::Ui, scene: &Scene) {
+    let words = scene.word_estimate();
+    let text = format!(
+        "about {words} of {SRAM_WORDS} words  ·  {} spheres, {} triangles",
+        scene.sphere_count(),
+        scene.triangle_count()
+    );
+    let label = if words > SRAM_WORDS {
+        ui.colored_label(ERROR, format!("{text}: too big for the chip"))
+    } else if words > SRAM_WORDS * 9 / 10 {
+        ui.colored_label(WARNING, text)
+    } else {
+        ui.weak(text)
+    };
+    label.on_hover_text(
+        "Estimate: 22 words of header and one bounding volume, 7 per sphere, 12 per triangle.\n\
+         A quad is 2 triangles and a box is 12. The TinyTracer app gives the exact number.",
+    );
+}
+
 fn selected_section(ui: &mut egui::Ui, scene: &mut Scene, selected: Option<usize>) {
     egui::CollapsingHeader::new("Selected").default_open(true).show(ui, |ui| {
-        let Some(sphere) = selected.and_then(|i| scene.spheres.get_mut(i)) else {
-            ui.weak("Click a sphere in the view or in the list.");
+        let Some(object) = selected.and_then(|i| scene.objects.get_mut(i)) else {
+            ui.weak("Click an object in the view or in the list.");
             return;
         };
-        sphere_editor(ui, sphere);
+        object_editor(ui, object);
     });
 }
 
-fn sphere_editor(ui: &mut egui::Ui, sphere: &mut Sphere) {
+fn object_editor(ui: &mut egui::Ui, object: &mut Object) {
     grid(ui, "selected", |ui| {
         ui.label("Name");
-        ui.text_edit_singleline(&mut sphere.name);
+        ui.text_edit_singleline(&mut object.name);
         ui.end_row();
 
-        ui.label("Position");
-        position_row(ui, &mut sphere.center);
-        ui.end_row();
+        shape_rows(ui, &mut object.shape);
 
-        ui.label("Radius");
-        ui.add(egui::DragValue::new(&mut sphere.radius).speed(0.05).range(0.05..=POS_LIMIT).max_decimals(2));
-        ui.end_row();
-
-        let material = &mut sphere.material;
+        let material = &mut object.material;
         ui.label("Colour");
         ui.color_edit_button_rgb(&mut material.color);
         ui.end_row();
@@ -243,12 +276,61 @@ fn sphere_editor(ui: &mut egui::Ui, sphere: &mut Sphere) {
         ui.end_row();
     });
 
-    let (chip_material, _) = sphere.material.chip_material();
-    ui.weak(format!("Written to the scene file as: {chip_material}"))
+    let (chip_material, _) = object.material.chip_material();
+    ui.weak(format!("Written to the scene file as: {} {chip_material}", object.shape.kind().keyword()))
         .on_hover_text("The chip has matte, mirror, glass and glow. Emissive above 0 becomes glow; otherwise metallic 0.5 or more becomes mirror; otherwise matte.");
 
-    let bottom = sphere.center.z - sphere.radius;
-    if bottom < 0.0 {
-        ui.colored_label(WARNING, format!("Bottom is at z = {bottom:.2}: below the ground (z = 0)."));
+    let (lowest, highest) = object.shape.bounds();
+    if lowest.z < 0.0 {
+        ui.colored_label(WARNING, format!("Lowest point is at z = {:.2}: below the ground (z = 0).", lowest.z));
+    }
+    if lowest.min_element() < -POS_LIMIT || highest.max_element() > POS_LIMIT {
+        ui.colored_label(WARNING, format!("Part of it is outside the chip's range of ±{POS_LIMIT}."));
+    }
+}
+
+/// The rows that place and size a shape. Every shape has a Position that moves
+/// it as a whole; below that come the numbers that are particular to the shape.
+fn shape_rows(ui: &mut egui::Ui, shape: &mut Shape) {
+    ui.label("Position");
+    let before = shape.center();
+    let mut center = before;
+    if position_row(ui, &mut center) {
+        shape.translate(center - before);
+    }
+    ui.end_row();
+
+    match shape {
+        Shape::Sphere { radius, .. } => {
+            ui.label("Radius");
+            ui.add(egui::DragValue::new(radius).speed(0.05).range(0.05..=POS_LIMIT).max_decimals(2));
+            ui.end_row();
+        }
+        Shape::Box { a, b } => {
+            // The file stores two opposite corners; a size is easier to think in.
+            ui.label("Size");
+            let center = (*a + *b) * 0.5;
+            let mut size = (*b - *a).abs();
+            if xyz_row(ui, &mut size, 0.05..=2.0 * POS_LIMIT) {
+                *a = center - size * 0.5;
+                *b = center + size * 0.5;
+            }
+            ui.end_row();
+        }
+        Shape::Tri(corners) => corner_rows(ui, corners),
+        Shape::Quad(corners) => {
+            corner_rows(ui, corners);
+            ui.label("");
+            ui.weak("Corners go in order around the edge.");
+            ui.end_row();
+        }
+    }
+}
+
+fn corner_rows(ui: &mut egui::Ui, corners: &mut [Vec3]) {
+    for (i, corner) in corners.iter_mut().enumerate() {
+        ui.label(format!("Corner {}", i + 1));
+        position_row(ui, corner);
+        ui.end_row();
     }
 }

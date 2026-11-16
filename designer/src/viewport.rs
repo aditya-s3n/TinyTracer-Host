@@ -9,7 +9,7 @@ use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 use glam::Vec3;
 
-use crate::scene::{srgb_to_linear3, Scene, MAX_SPHERES};
+use crate::scene::{srgb_to_linear3, Material, Scene, Shape, MAX_SPHERES, MAX_TRIANGLES};
 
 const LOOK_DEG_PER_POINT: f32 = 0.25;
 const MOVE_SPEED: f32 = 12.0;
@@ -20,6 +20,16 @@ const FOV_DEG_PER_SCROLL_POINT: f32 = 0.05;
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct GpuSphere {
     center_radius: [f32; 4],
+    color_metallic: [f32; 4],
+    rough_emissive: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GpuTriangle {
+    v0: [f32; 4],
+    v1: [f32; 4],
+    v2: [f32; 4],
     color_metallic: [f32; 4],
     rough_emissive: [f32; 4],
 }
@@ -37,6 +47,7 @@ struct Globals {
     ground_a: [f32; 4],
     ground_b: [f32; 4],
     spheres: [GpuSphere; MAX_SPHERES],
+    triangles: [GpuTriangle; MAX_TRIANGLES],
 }
 
 fn vec4(v: impl Into<[f32; 3]>, w: f32) -> [f32; 4] {
@@ -47,9 +58,8 @@ fn vec4(v: impl Into<[f32; 3]>, w: f32) -> [f32; 4] {
 impl Globals {
     fn new(scene: &Scene, selected: Option<usize>, encode_srgb: bool, side_pixels: f32) -> Box<Self> {
         let (f, r, u) = scene.camera.basis();
-        let count = scene.spheres.len().min(MAX_SPHERES);
         let mut globals = Box::new(Self {
-            origin: vec4(scene.camera.pos, count as f32),
+            origin: vec4(scene.camera.pos, 0.0),
             forward: vec4(f, selected.map_or(-1.0, |i| i as f32)),
             right: vec4(r, if encode_srgb { 1.0 } else { 0.0 }),
             // The image spans -1..1, so one pixel is 2 / side wide.
@@ -59,15 +69,43 @@ impl Globals {
             ground_a: vec4(srgb_to_linear3(scene.ground[0]), 0.0),
             ground_b: vec4(srgb_to_linear3(scene.ground[1]), 0.0),
             spheres: [GpuSphere::zeroed(); MAX_SPHERES],
+            triangles: [GpuTriangle::zeroed(); MAX_TRIANGLES],
         });
-        for (gpu, s) in globals.spheres.iter_mut().zip(&scene.spheres) {
-            *gpu = GpuSphere {
-                // A zero radius would divide by zero when the shader builds the normal.
-                center_radius: vec4(s.center, s.radius.max(1e-3)),
-                color_metallic: vec4(srgb_to_linear3(s.material.color), s.material.metallic),
-                rough_emissive: [s.material.roughness, s.material.emissive, 0.0, 0.0],
-            };
+
+        // Every sphere and triangle carries the index of the object it belongs to,
+        // so the shader can highlight all 12 triangles of a selected box.
+        let color_metallic = |m: &Material| vec4(srgb_to_linear3(m.color), m.metallic);
+        let rough_emissive = |m: &Material, object: usize| [m.roughness, m.emissive, object as f32, 0.0];
+        let (mut sphere_count, mut triangle_count) = (0, 0);
+        for (index, object) in scene.objects.iter().enumerate() {
+            let material = &object.material;
+            if let Shape::Sphere { center, radius } = object.shape {
+                if sphere_count < MAX_SPHERES {
+                    globals.spheres[sphere_count] = GpuSphere {
+                        // A zero radius would divide by zero when the shader builds the normal.
+                        center_radius: vec4(center, radius.max(1e-3)),
+                        color_metallic: color_metallic(material),
+                        rough_emissive: rough_emissive(material, index),
+                    };
+                    sphere_count += 1;
+                }
+                continue;
+            }
+            for [v0, v1, v2] in object.shape.triangles() {
+                if triangle_count < MAX_TRIANGLES {
+                    globals.triangles[triangle_count] = GpuTriangle {
+                        v0: vec4(v0, 0.0),
+                        v1: vec4(v1, 0.0),
+                        v2: vec4(v2, 0.0),
+                        color_metallic: color_metallic(material),
+                        rough_emissive: rough_emissive(material, index),
+                    };
+                    triangle_count += 1;
+                }
+            }
         }
+        globals.origin[3] = sphere_count as f32;
+        globals.sky_top[3] = triangle_count as f32;
         globals
     }
 }

@@ -5,6 +5,9 @@
 // to tell matte from metal and rough from polished.
 
 const MAX_SPHERES: i32 = 64;
+const MAX_TRIANGLES: i32 = 64;
+// Hit ids from here up are triangles: id - TRIANGLE_BASE is the triangle's index.
+const TRIANGLE_BASE: i32 = MAX_SPHERES;
 const EPS: f32 = 1e-3;
 const GROUND_MAX_T: f32 = 256.0;
 const CHECKER_SIZE: f32 = 4.0;
@@ -17,19 +20,29 @@ const SUN_COLOR: vec3f = vec3f(1.0, 0.96, 0.88);
 struct Sphere {
     center_radius: vec4f,   // xyz centre, w radius
     color_metallic: vec4f,  // rgb linear colour, w metallic
-    rough_emissive: vec4f,  // x roughness, y emissive strength
+    rough_emissive: vec4f,  // x roughness, y emissive strength, z index of its object
+}
+
+// Quads and boxes arrive already split into triangles.
+struct Triangle {
+    v0: vec4f,
+    v1: vec4f,
+    v2: vec4f,
+    color_metallic: vec4f,  // as Sphere
+    rough_emissive: vec4f,  // as Sphere
 }
 
 struct Globals {
     origin: vec4f,       // xyz camera position, w sphere count
-    forward: vec4f,      // xyz F, w selected sphere index (-1 for none)
+    forward: vec4f,      // xyz F, w selected object index (-1 for none)
     right: vec4f,        // xyz R, w 1 when the shader must sRGB-encode its output
     up: vec4f,           // xyz U, w size of one pixel in image coordinates
     sky_horizon: vec4f,  // rgb linear, w sky strength
-    sky_top: vec4f,      // rgb linear
+    sky_top: vec4f,      // rgb linear, w triangle count
     ground_a: vec4f,     // rgb linear
     ground_b: vec4f,     // rgb linear
     spheres: array<Sphere, MAX_SPHERES>,
+    triangles: array<Triangle, MAX_TRIANGLES>,
 }
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -52,7 +65,7 @@ fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
 
 struct Hit {
     t: f32,
-    id: i32,     // sphere index, GROUND or NO_HIT
+    id: i32,     // sphere index, TRIANGLE_BASE + triangle index, GROUND or NO_HIT
     n: vec3f,
 }
 
@@ -61,6 +74,7 @@ struct Surface {
     metallic: f32,
     roughness: f32,
     emissive: f32,
+    object: i32,   // index of the object in the scene, -2 for the ground
 }
 
 fn sky(d: vec3f) -> vec3f {
@@ -88,6 +102,27 @@ fn hit_sphere(o: vec3f, d: vec3f, s: vec4f) -> f32 {
     return -1.0;
 }
 
+// Moller-Trumbore: distance to the triangle, hit from either side, or -1.
+fn hit_triangle(o: vec3f, d: vec3f, v0: vec3f, v1: vec3f, v2: vec3f) -> f32 {
+    let e1 = v1 - v0;
+    let e2 = v2 - v0;
+    let p = cross(d, e2);
+    let det = dot(e1, p);
+    if abs(det) < 1e-8 {
+        return -1.0;
+    }
+    let inv = 1.0 / det;
+    let s = o - v0;
+    let u = dot(s, p) * inv;
+    let q = cross(s, e1);
+    let v = dot(d, q) * inv;
+    if u < 0.0 || v < 0.0 || u + v > 1.0 {
+        return -1.0;
+    }
+    let t = dot(e2, q) * inv;
+    return select(-1.0, t, t > EPS);
+}
+
 fn trace(o: vec3f, d: vec3f) -> Hit {
     var hit = Hit(1e30, NO_HIT, vec3f(0.0, 0.0, 1.0));
     let count = i32(g.origin.w);
@@ -98,13 +133,24 @@ fn trace(o: vec3f, d: vec3f) -> Hit {
             hit.id = i;
         }
     }
-    if hit.id >= 0 {
+    let triangle_count = i32(g.sky_top.w);
+    for (var i = 0; i < triangle_count; i++) {
+        let t = hit_triangle(o, d, g.triangles[i].v0.xyz, g.triangles[i].v1.xyz, g.triangles[i].v2.xyz);
+        if t > 0.0 && t < hit.t {
+            hit.t = t;
+            hit.id = TRIANGLE_BASE + i;
+        }
+    }
+    if hit.id >= TRIANGLE_BASE {
+        let tri = g.triangles[hit.id - TRIANGLE_BASE];
+        hit.n = normalize(cross(tri.v1.xyz - tri.v0.xyz, tri.v2.xyz - tri.v0.xyz));
+    } else if hit.id >= 0 {
         let s = g.spheres[hit.id].center_radius;
         hit.n = (o + d * hit.t - s.xyz) / s.w;
-        // Seen from inside the sphere: flip the normal to face the ray.
-        if dot(hit.n, d) > 0.0 {
-            hit.n = -hit.n;
-        }
+    }
+    // Seen from inside a sphere or from the back of a triangle: flip the normal to face the ray.
+    if dot(hit.n, d) > 0.0 {
+        hit.n = -hit.n;
     }
     if d.z < 0.0 && o.z > 0.0 {
         let t = o.z / -d.z;
@@ -119,10 +165,18 @@ fn surface(hit: Hit, p: vec3f) -> Surface {
     if hit.id == GROUND {
         let cell = floor(p.xy / CHECKER_SIZE);
         let odd = abs(cell.x + cell.y) % 2.0;
-        return Surface(mix(g.ground_a.rgb, g.ground_b.rgb, odd), 0.0, 1.0, 0.0);
+        return Surface(mix(g.ground_a.rgb, g.ground_b.rgb, odd), 0.0, 1.0, 0.0, -2);
     }
-    let s = g.spheres[hit.id];
-    return Surface(s.color_metallic.rgb, s.color_metallic.w, s.rough_emissive.x, s.rough_emissive.y);
+    var color_metallic = g.spheres[0].color_metallic;
+    var rough_emissive = g.spheres[0].rough_emissive;
+    if hit.id >= TRIANGLE_BASE {
+        color_metallic = g.triangles[hit.id - TRIANGLE_BASE].color_metallic;
+        rough_emissive = g.triangles[hit.id - TRIANGLE_BASE].rough_emissive;
+    } else {
+        color_metallic = g.spheres[hit.id].color_metallic;
+        rough_emissive = g.spheres[hit.id].rough_emissive;
+    }
+    return Surface(color_metallic.rgb, color_metallic.w, rough_emissive.x, rough_emissive.y, i32(rough_emissive.z));
 }
 
 // 1 when the sun reaches p, 0 when something is in the way.
@@ -179,10 +233,13 @@ fn shade(o: vec3f, d: vec3f) -> vec3f {
 
     color += s.albedo * s.emissive;
 
-    // Orange rim on the selected sphere.
-    if hit.id == i32(g.forward.w) {
-        let rim = pow(1.0 - n_dot_v, 2.5);
-        color = mix(color, vec3f(1.0, 0.45, 0.05), clamp(rim * 1.6, 0.0, 0.9));
+    // Selected object: an orange rim on a sphere. Flat faces have no rim, so they get an even tint.
+    if s.object == i32(g.forward.w) {
+        var amount = 0.4;
+        if hit.id < TRIANGLE_BASE {
+            amount = clamp(pow(1.0 - n_dot_v, 2.5) * 1.6, 0.0, 0.9);
+        }
+        color = mix(color, vec3f(1.0, 0.45, 0.05), amount);
     }
     return color;
 }

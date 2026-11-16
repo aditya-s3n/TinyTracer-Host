@@ -165,7 +165,7 @@ impl TinyTracer {
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| std::fs::write(path, &text));
         self.compile_result = Some(match written {
-            Ok(()) => Ok(format!("Wrote {} ({} spheres)", path.display(), scene.spheres.len())),
+            Ok(()) => Ok(format!("Wrote {} ({} objects)", path.display(), scene.objects.len())),
             Err(e) => Err(format!("Could not write {}: {e}", path.display())),
         });
 

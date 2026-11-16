@@ -19,7 +19,7 @@ use viewport::Viewport;
 
 struct DesignerApp {
     scene: Scene,
-    /// Index into `scene.spheres`.
+    /// Index into `scene.objects`.
     selected: Option<usize>,
     viewport: Viewport,
     /// Scene file output and the link to the TinyTracer app.
