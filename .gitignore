@@ -12,8 +12,14 @@ venv/
 # hello_imgui saved window/theme state
 *.ini
 
-# Rust build output (scene designer)
-designer/target/
+# Rust build output and artifacts (scene designer)
+target/
+debug/
+**/*.rs.bk
+*.pdb
 
 # Render output: one folder per run (PNG, logs, scene, memory image)
 runs/
+
+# Scenes saved by the designer
+scenes/
